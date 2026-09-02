@@ -1,0 +1,45 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+context: |
+  Tech stack: Go, standard library plus github.com/rollfuse/go-sdk and
+  github.com/open-feature/go-sdk. No third-party runtime dependencies
+  beyond those two.
+
+  Domain: an OpenFeature (CNCF spec, https://openfeature.dev)
+  FeatureProvider implementation for the rollfuse feature-flag platform.
+  This repository is a thin adapter — it holds no evaluation logic of its
+  own; every actual evaluation runs inside the wrapped *rollfuse.Client
+  (github.com/rollfuse/go-sdk), locally and deterministically. This
+  package's own logic is entirely translation: OpenFeature's per-type
+  Evaluation methods and FlattenedContext on one side, go-sdk's Evaluate
+  and EvaluationResult on the other, plus mapping error/reason semantics
+  between the two specs.
+
+  Correctness constraint: the mapping in both directions must be
+  faithful to the OpenFeature spec (https://openfeature.dev/specification/) —
+  particularly error codes (PROVIDER_NOT_READY, FLAG_NOT_FOUND,
+  TARGETING_KEY_MISSING, TYPE_MISMATCH) and Reason values
+  (TARGETING_MATCH, DISABLED, DEFAULT, ERROR). See provider.go's `resolve`
+  function's own doc comment for a subtle interaction already discovered
+  and fixed here: go-sdk's WithFallback option, if ever passed to the
+  wrapped client, silently converts what should be a FLAG_NOT_FOUND or
+  PROVIDER_NOT_READY error into a successful default_fallback result —
+  this provider must never pass it, precisely so those OpenFeature error
+  codes remain reachable.
+
+# Per-artifact rules (optional)
+rules:
+  design:
+    - Any change to how OpenFeature error codes or Reason values are
+      derived must cite the exact OpenFeature spec requirement it
+      satisfies (or the go-sdk behavior it accounts for), not just
+      describe the new mapping.
+  tasks:
+    - Every task touching provider.go's resolve/BooleanEvaluation/etc.
+      must include a go test ./... -race verification step and, if it
+      changes observable evaluation-context or error-code behavior, an
+      update to example_test.go or a new provider_test.go case
+      exercising it through the real openfeature.Client API, not only
+      the Provider struct directly.
