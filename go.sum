@@ -6,6 +6,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rollfuse/go-sdk v0.1.0 h1:05goHXVRpLL+xxYm+P2O7uqDc2JA/gjBdmwWsEm9ahA=
 github.com/rollfuse/go-sdk v0.1.0/go.mod h1:zBrMtA0YW/6mnMh44yeb+F1Xl3UWrxFQVv8OTjtMnZU=
+github.com/rollfuse/go-sdk v0.1.1 h1:GpQpFshtDhqscRsCG+EAtOWFisK9gmnhyiDE9KlXNnA=
+github.com/rollfuse/go-sdk v0.1.1/go.mod h1:sWhD8lEGnRQKftnXFXkhvLhaIyzMovOBEb7RH/J1Q7o=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
