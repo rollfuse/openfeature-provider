@@ -23,17 +23,31 @@ import (
 	rollfuse "github.com/rollfuse/go-sdk"
 )
 
+// eventChannelCapacity bounds the buffered Event channel EventChannel
+// returns. A slow or absent consumer draining it (openfeature.go-sdk's own
+// event executor, normally) should never block trackConfigChange, which
+// runs from the wrapped Client's own background poll goroutine — losing
+// an occasional redundant ProviderConfigChange event under sustained
+// backpressure is preferable to stalling Configuration polling.
+const eventChannelCapacity = 16
+
 // Provider adapts a *rollfuse.Client to openfeature.FeatureProvider (plus
 // openfeature.ContextAwareStateHandler, so openfeature.SetProviderAndWait
 // blocks until the first Configuration fetch succeeds, exactly like
-// calling client.Start yourself would).
+// calling client.Start yourself would, and openfeature.EventHandler, so
+// it emits ProviderConfigChange when the underlying Configuration changes
+// — task 10.1).
 type Provider struct {
 	client *rollfuse.Client
+
+	events      chan openfeature.Event
+	unsubscribe func()
 }
 
 var (
 	_ openfeature.FeatureProvider          = (*Provider)(nil)
 	_ openfeature.ContextAwareStateHandler = (*Provider)(nil)
+	_ openfeature.EventHandler             = (*Provider)(nil)
 )
 
 // New wraps an already-constructed *rollfuse.Client. The Client is not
@@ -43,7 +57,20 @@ var (
 // it to this constructor instead of calling client.Start/client.Evaluate
 // yourself.
 func New(client *rollfuse.Client) *Provider {
-	return &Provider{client: client}
+	return &Provider{
+		client: client,
+		events: make(chan openfeature.Event, eventChannelCapacity),
+	}
+}
+
+// EventChannel implements openfeature.EventHandler: the channel
+// openfeature.go-sdk's event executor drains to learn about this
+// provider's lifecycle events, per task 10.1. ProviderReady/ProviderError
+// need no wiring here — the SDK derives them itself from
+// InitWithContext's own outcome (task 10.2's own doc comment explains
+// why).
+func (p *Provider) EventChannel() <-chan openfeature.Event {
+	return p.events
 }
 
 // Metadata identifies this provider to OpenFeature.
@@ -70,8 +97,20 @@ func (p *Provider) Init(_ openfeature.EvaluationContext) error {
 }
 
 // InitWithContext starts the underlying rollfuse.Client, blocking until
-// the first Configuration fetch succeeds or ctx is done.
+// the first Configuration fetch succeeds or ctx is done. Subscribes to
+// the Client's own Configuration changes first, so a change that lands
+// mid-Start (the first fetch itself) is never missed. Readiness is
+// reported accurately (task 10.2) by this method's own outcome alone —
+// returning nil makes openfeature.go-sdk fire ProviderReady, returning an
+// error fires ProviderError — with no separate status this Provider needs
+// to maintain: a FeatureProvider that doesn't implement CommonProvider's
+// (deprecated) status field is, per the SDK's own doc comment, "assumed
+// to be ready immediately," and the SDK derives its actual tracked state
+// from exactly the events InitWithContext's outcome and trackConfigChange
+// (below) produce.
 func (p *Provider) InitWithContext(ctx context.Context, _ openfeature.EvaluationContext) error {
+	p.unsubscribe = p.client.Subscribe(p.trackConfigChange)
+
 	if err := p.client.Start(ctx); err != nil {
 		return &openfeature.ProviderInitError{
 			ErrorCode: openfeature.ProviderFatalCode,
@@ -82,8 +121,27 @@ func (p *Provider) InitWithContext(ctx context.Context, _ openfeature.Evaluation
 	return nil
 }
 
-// Shutdown stops the underlying rollfuse.Client's background refresh and
-// exposure-flush loops, with a 5-second timeout. Prefer ShutdownWithContext.
+// trackConfigChange sends a ProviderConfigChange event for
+// openfeature.go-sdk's event executor to relay to registered handlers
+// (task 10.1), matching this package's own Metadata().Name. Non-blocking:
+// see eventChannelCapacity's own doc comment for why a full channel drops
+// this event rather than blocking the Client's background poll goroutine
+// that calls it.
+func (p *Provider) trackConfigChange() {
+	event := openfeature.Event{
+		ProviderName: p.Metadata().Name,
+		EventType:    openfeature.ProviderConfigChange,
+	}
+
+	select {
+	case p.events <- event:
+	default:
+	}
+}
+
+// Shutdown unsubscribes from the underlying rollfuse.Client and stops its
+// background refresh and exposure-flush loops, with a 5-second timeout.
+// Prefer ShutdownWithContext.
 func (p *Provider) Shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -91,11 +149,15 @@ func (p *Provider) Shutdown() {
 	_ = p.ShutdownWithContext(ctx)
 }
 
-// ShutdownWithContext stops the underlying rollfuse.Client. ctx is
-// currently unused by go-sdk's own Close (it has no blocking network
-// call to cancel), accepted only to satisfy
-// openfeature.ContextAwareStateHandler.
+// ShutdownWithContext unsubscribes from the underlying rollfuse.Client's
+// Configuration changes and stops it. ctx is currently unused by go-sdk's
+// own Close (it has no blocking network call to cancel), accepted only to
+// satisfy openfeature.ContextAwareStateHandler.
 func (p *Provider) ShutdownWithContext(_ context.Context) error {
+	if p.unsubscribe != nil {
+		p.unsubscribe()
+	}
+
 	return p.client.Close()
 }
 
@@ -155,9 +217,22 @@ func resolve[T any](ctx context.Context, p *Provider, flag string, defaultValue 
 	// defaultValue — this provider's job is to fall back to *that* one,
 	// with the correct error code, not to ask go-sdk to silently
 	// substitute its own).
+	attrs, unrepresentableKeys := stringAttributes(flatCtx)
+
 	var opts []rollfuse.EvaluateOption
-	if attrs := stringAttributes(flatCtx); len(attrs) > 0 {
+	if len(attrs) > 0 {
 		opts = append(opts, rollfuse.WithAttributes(attrs))
+	}
+
+	// task 10.3: an evaluation context value the attribute model can't
+	// represent is reported here, on every ResolutionDetail this call
+	// produces (including the error-path ones below), rather than
+	// discarded silently — a diagnostic path a host can inspect
+	// (ResolutionDetail.FlagMetadata) regardless of how the evaluation
+	// itself turns out.
+	var metadata openfeature.FlagMetadata
+	if len(unrepresentableKeys) > 0 {
+		metadata = openfeature.FlagMetadata{"unrepresentable_context_keys": unrepresentableKeys}
 	}
 
 	result, err := p.client.Evaluate(subjectKey, flag, opts...)
@@ -165,6 +240,7 @@ func resolve[T any](ctx context.Context, p *Provider, flag string, defaultValue 
 		return defaultValue, openfeature.ProviderResolutionDetail{
 			ResolutionError: resolutionErrorFor(err),
 			Reason:          openfeature.ErrorReason,
+			FlagMetadata:    metadata,
 		}
 	}
 
@@ -174,14 +250,16 @@ func resolve[T any](ctx context.Context, p *Provider, flag string, defaultValue 
 			ResolutionError: openfeature.NewTypeMismatchResolutionError(
 				fmt.Sprintf("flag %q's variation %q did not decode into the requested type: %v", flag, result.VariationKey, typeErr),
 			),
-			Reason:  openfeature.ErrorReason,
-			Variant: result.VariationKey,
+			Reason:       openfeature.ErrorReason,
+			Variant:      result.VariationKey,
+			FlagMetadata: metadata,
 		}
 	}
 
 	return value, openfeature.ProviderResolutionDetail{
-		Reason:  reasonFor(result.Reason),
-		Variant: result.VariationKey,
+		Reason:       reasonFor(result.Reason),
+		Variant:      result.VariationKey,
+		FlagMetadata: metadata,
 	}
 }
 
@@ -235,13 +313,16 @@ func reasonFor(reason rollfuse.EvaluationReason) openfeature.Reason {
 // go-sdk's WithAttributes expects (rule matching is strict string
 // equality — see go-sdk's own README), skipping targetingKey (already
 // consumed as the subject key) and any value that isn't already a
-// string. A non-string attribute (a number, bool, nested object) simply
-// never matches a rule condition, the same as an attribute omitted
-// entirely — this provider does not silently stringify with fmt.Sprintf,
-// which would let e.g. attribute values `"true"` (string) and `true`
-// (bool) match a condition meant for only one of them.
-func stringAttributes(flatCtx openfeature.FlattenedContext) map[string]string {
-	attrs := make(map[string]string, len(flatCtx))
+// string. A non-string attribute (a number, bool, nested object) cannot
+// be represented in rollfuse's attribute model — this provider does not
+// silently stringify it with fmt.Sprintf, which would let e.g. attribute
+// values `"true"` (string) and `true` (bool) match a condition meant for
+// only one of them — so it never matches a rule condition, the same as
+// an attribute omitted entirely, but its key is returned separately
+// (task 10.3's diagnostic path — see resolve's own use of it) rather
+// than discarded with no trace.
+func stringAttributes(flatCtx openfeature.FlattenedContext) (attrs map[string]string, unrepresentableKeys []string) {
+	attrs = make(map[string]string, len(flatCtx))
 
 	for k, v := range flatCtx {
 		if k == openfeature.TargetingKey {
@@ -250,8 +331,12 @@ func stringAttributes(flatCtx openfeature.FlattenedContext) map[string]string {
 
 		if s, ok := v.(string); ok {
 			attrs[k] = s
+
+			continue
 		}
+
+		unrepresentableKeys = append(unrepresentableKeys, k)
 	}
 
-	return attrs
+	return attrs, unrepresentableKeys
 }
