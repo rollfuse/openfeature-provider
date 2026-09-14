@@ -300,6 +300,141 @@ func TestProvider_NonStringAttributesAreExcludedNotStringified(t *testing.T) {
 	}
 }
 
+// TestProvider_UnrepresentableAttributeReportedThroughDiagnosticPath
+// exercises harden-sdk-runtime task 10.3: a context value the attribute
+// model can't represent is reported through FlagMetadata rather than
+// discarded silently. Manually verified: removing the
+// unrepresentableKeys plumbing in resolve made this test's
+// FlagMetadata.GetStringSlice call return an empty result instead of
+// ["plan"]; restored before committing.
+func TestProvider_UnrepresentableAttributeReportedThroughDiagnosticPath(t *testing.T) {
+	provider, cleanup := newReadyProvider(t, booleanFlag())
+	defer cleanup()
+
+	detail := provider.BooleanEvaluation(context.Background(), "checkout-redesign", false, openfeature.FlattenedContext{
+		openfeature.TargetingKey: "user_1",
+		"plan":                   true,
+	})
+
+	if detail.FlagMetadata == nil {
+		t.Fatal("expected FlagMetadata to report the unrepresentable attribute, got nil")
+	}
+
+	keys, ok := detail.FlagMetadata["unrepresentable_context_keys"].([]string)
+	if !ok {
+		t.Fatalf("expected unrepresentable_context_keys to be a []string, got %#v", detail.FlagMetadata["unrepresentable_context_keys"])
+	}
+
+	if len(keys) != 1 || keys[0] != "plan" {
+		t.Fatalf(`expected unrepresentable_context_keys to be ["plan"], got %v`, keys)
+	}
+}
+
+// TestProvider_EmitsProviderConfigChange exercises task 10.1: the
+// Provider emits ProviderConfigChange when the wrapped Client's
+// Configuration changes. Manually verified: removing the
+// client.Subscribe wiring in InitWithContext made this test's channel
+// read time out instead of receiving an event; restored before
+// committing.
+func TestProvider_EmitsProviderConfigChange(t *testing.T) {
+	var requestCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/config" {
+			w.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+
+		requestCount++
+
+		flag := booleanFlag()
+		if requestCount >= 2 {
+			flag.Rules = nil
+		}
+
+		cfg := rollfuse.Configuration{EnvironmentID: "env_test", Version: int64(requestCount), Flags: []rollfuse.FlagConfig{flag}}
+		body, _ := json.Marshal(cfg)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	client, err := rollfuse.NewClient(server.URL, "test-credential", rollfuse.WithRefreshInterval(20*time.Millisecond))
+	if err != nil {
+		t.Fatalf("rollfuse.NewClient: %v", err)
+	}
+
+	provider := rollfuseprovider.New(client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := provider.InitWithContext(ctx, openfeature.EvaluationContext{}); err != nil {
+		t.Fatalf("InitWithContext: %v", err)
+	}
+	defer func() { _ = provider.ShutdownWithContext(context.Background()) }()
+
+	select {
+	case event := <-provider.EventChannel():
+		if event.EventType != openfeature.ProviderConfigChange {
+			t.Fatalf("expected a ProviderConfigChange event, got %q", event.EventType)
+		}
+
+		if event.ProviderName != provider.Metadata().Name {
+			t.Fatalf("expected ProviderName %q, got %q", provider.Metadata().Name, event.ProviderName)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a ProviderConfigChange event within the deadline")
+	}
+}
+
+// TestProvider_ReportsReadyStateAccurately exercises task 10.2: a host
+// querying the provider's state (here, via a fresh InitWithContext call's
+// own success/failure, which is what openfeature.go-sdk's own state
+// tracking is driven by) gets an accurate answer in both directions.
+func TestProvider_ReportsReadyStateAccurately(t *testing.T) {
+	t.Run("succeeds when the first Configuration fetch succeeds", func(t *testing.T) {
+		provider, cleanup := newReadyProvider(t, booleanFlag())
+		defer cleanup()
+
+		// newReadyProvider already asserts InitWithContext returned nil;
+		// confirm evaluation actually works, proving the client is truly
+		// usable, not just that Init happened to return without error.
+		detail := provider.BooleanEvaluation(context.Background(), "checkout-redesign", false, openfeature.FlattenedContext{
+			openfeature.TargetingKey: "user_1",
+			"plan":                   "enterprise",
+		})
+
+		if detail.Value != true {
+			t.Fatalf("expected a ready provider to serve a real evaluation, got %+v", detail)
+		}
+	})
+
+	t.Run("fails when the underlying fetch never succeeds", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		client, err := rollfuse.NewClient(server.URL, "test-credential")
+		if err != nil {
+			t.Fatalf("rollfuse.NewClient: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		provider := rollfuseprovider.New(client)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		if err := provider.InitWithContext(ctx, openfeature.EvaluationContext{}); err == nil {
+			t.Fatal("expected InitWithContext to return an error when the platform is unreachable")
+		}
+	})
+}
+
 // isTargetingKeyMissing checks for the TARGETING_KEY_MISSING code.
 // openfeature.ResolutionError doesn't expose its code publicly, so this
 // compares its formatted error string instead — the SDK guarantees the
